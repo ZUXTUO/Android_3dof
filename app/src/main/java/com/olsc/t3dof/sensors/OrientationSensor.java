@@ -17,9 +17,12 @@ import android.view.Surface;
  *   1. 旋转矢量（TYPE_ROTATION_VECTOR）        —— 绝对姿态，精度最高，无漂移
  *   2. 游戏旋转矢量（TYPE_GAME_ROTATION_VECTOR）—— 陀螺仪 + 加速度计融合，相对姿态，yaw 会缓慢漂移
  *   3. 加速度计 + 磁力计                        —— 需要磁力计
- *   4. 仅陀螺仪积分                             —— 最后兜底，整体会随时间漂移
+ *   4. 仅陀螺仪积分                             —— 整体会随时间漂移
+ *   5. 仅重力矢量（加速度计 / 重力传感器）      —— 最后兜底，只有俯仰+滚转（2DOF），无航向
  *
  * 缺少磁力计时无法获得绝对航向，但不影响基础的 3DOF 旋转跟随效果。
+ * 若连陀螺仪都没有（如低价 Android 手表），则退化为第 5 级：用重力方向解算
+ * 倾斜姿态，画面仍会跟随设备的俯仰/滚转，但绕竖直轴转动时画面不跟随。
  */
 public class OrientationSensor implements SensorEventListener {
 
@@ -34,7 +37,9 @@ public class OrientationSensor implements SensorEventListener {
         /** 加速度计 + 磁力计。 */
         ACCEL_MAG,
         /** 仅陀螺仪积分。 */
-        GYROSCOPE
+        GYROSCOPE,
+        /** 仅重力矢量（加速度计或重力传感器），只有俯仰/滚转。 */
+        ACCEL_ONLY
     }
 
     private SensorManager sensorManager;
@@ -43,6 +48,7 @@ public class OrientationSensor implements SensorEventListener {
     private Sensor accelerometer;
     private Sensor magnetometer;
     private Sensor gyroscope;
+    private Sensor gravitySensor;
 
     private Mode mode = Mode.NONE;
 
@@ -53,6 +59,10 @@ public class OrientationSensor implements SensorEventListener {
     private final float[] geomagnetic = new float[3];
     private boolean hasGravity = false;
     private boolean hasGeomagnetic = false;
+
+    // 仅重力模式相关：低通滤波后的重力矢量
+    private final float[] filteredGravity = new float[3];
+    private boolean hasFilteredGravity = false;
 
     // 陀螺仪积分相关
     private long lastGyroTimestamp = 0L;
@@ -84,6 +94,9 @@ public class OrientationSensor implements SensorEventListener {
         accelerometer = sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
         magnetometer = sm.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD);
         gyroscope = sm.getDefaultSensor(Sensor.TYPE_GYROSCOPE);
+        gravitySensor = sm.getDefaultSensor(Sensor.TYPE_GRAVITY);
+
+        logAvailableSensors(sm);
 
         if (rotationSensor != null) {
             mode = Mode.ROTATION_VECTOR;
@@ -93,10 +106,25 @@ public class OrientationSensor implements SensorEventListener {
             mode = Mode.ACCEL_MAG;
         } else if (gyroscope != null) {
             mode = Mode.GYROSCOPE;
+        } else if (accelerometer != null || gravitySensor != null) {
+            // 只有重力方向可用：能解算俯仰/滚转，无法解算航向
+            mode = Mode.ACCEL_ONLY;
         } else {
             mode = Mode.NONE;
         }
         return mode;
+    }
+
+    /**
+     * 打印设备上报的全部传感器，便于排查“系统设置说有、应用却检测不到”的差异。
+     */
+    private void logAvailableSensors(SensorManager sm) {
+        java.util.List<Sensor> all = sm.getSensorList(Sensor.TYPE_ALL);
+        StringBuilder sb = new StringBuilder("设备传感器共 ").append(all.size()).append(" 个: ");
+        for (Sensor s : all) {
+            sb.append('[').append(s.getType()).append(' ').append(s.getName()).append("] ");
+        }
+        android.util.Log.d("OrientationSensor", sb.toString());
     }
 
     /** 返回当前（或最近一次检测到的）模式。 */
@@ -115,6 +143,8 @@ public class OrientationSensor implements SensorEventListener {
                 return "加速度计 + 磁力计";
             case GYROSCOPE:
                 return "陀螺仪积分";
+            case ACCEL_ONLY:
+                return "仅重力矢量（俯仰/滚转）";
             default:
                 return "无可用传感器";
         }
@@ -129,6 +159,8 @@ public class OrientationSensor implements SensorEventListener {
                 return "未检测到磁力计或旋转矢量，已使用游戏旋转矢量：航向 (yaw) 无绝对参考且会缓慢漂移。";
             case GYROSCOPE:
                 return "未检测到旋转矢量与磁力计，已退化为陀螺仪积分：姿态会随时间漂移。";
+            case ACCEL_ONLY:
+                return "未检测到陀螺仪，仅用重力方向解算倾斜：跟随俯仰/滚转，绕竖直轴转动（航向）时不跟随。";
             case ROTATION_VECTOR:
             case ACCEL_MAG:
                 return null;
@@ -171,6 +203,15 @@ public class OrientationSensor implements SensorEventListener {
                 Matrix.setIdentityM(rotationMatrix, 0);
                 sensorManager.registerListener(this, gyroscope, SensorManager.SENSOR_DELAY_GAME);
                 break;
+            case ACCEL_ONLY:
+                // 优先用系统已滤好的重力传感器，退化时对原始加速度做低通滤波
+                hasFilteredGravity = false;
+                if (gravitySensor != null) {
+                    sensorManager.registerListener(this, gravitySensor, SensorManager.SENSOR_DELAY_GAME);
+                } else if (accelerometer != null) {
+                    sensorManager.registerListener(this, accelerometer, SensorManager.SENSOR_DELAY_GAME);
+                }
+                break;
             default:
                 android.util.Log.w("OrientationSensor", "无可用姿态传感器，3DOF 将保持静止");
                 break;
@@ -205,9 +246,24 @@ public class OrientationSensor implements SensorEventListener {
                 break;
 
             case Sensor.TYPE_ACCELEROMETER:
+                if (mode == Mode.ACCEL_ONLY) {
+                    // 单加速度计模式：先滤出重力方向，再解算倾斜
+                    lowPassGravity(event.values);
+                    if (updateRotationMatrixFromGravity(filteredGravity)) {
+                        markReady(event.sensor.getType());
+                    }
+                    break;
+                }
                 System.arraycopy(event.values, 0, gravity, 0, 3);
                 hasGravity = true;
                 updateRotationMatrixFromAccelMag();
+                break;
+
+            case Sensor.TYPE_GRAVITY:
+                // 系统已融合好的重力矢量，直接解算倾斜
+                if (updateRotationMatrixFromGravity(event.values)) {
+                    markReady(event.sensor.getType());
+                }
                 break;
 
             case Sensor.TYPE_MAGNETIC_FIELD:
@@ -244,6 +300,68 @@ public class OrientationSensor implements SensorEventListener {
                 markReady(Sensor.TYPE_ACCELEROMETER);
             }
         }
+    }
+
+    /**
+     * 一阶低通滤波，从原始加速度中提取重力方向，抑制手部运动产生的线性加速度。
+     */
+    private void lowPassGravity(float[] a) {
+        final float alpha = 0.85f;
+        if (!hasFilteredGravity) {
+            System.arraycopy(a, 0, filteredGravity, 0, 3);
+            hasFilteredGravity = true;
+            return;
+        }
+        for (int i = 0; i < 3; i++) {
+            filteredGravity[i] = alpha * filteredGravity[i] + (1f - alpha) * a[i];
+        }
+    }
+
+    /**
+     * 仅用重力矢量解算姿态（俯仰 + 滚转，航向恒为 0）。
+     *
+     * 参考姿态为“设备平放、屏幕朝上”（单位阵）。做法是求把设备坐标系下的天顶
+     * 单位向量 n 旋转到世界 +Z 轴的<b>最小旋转</b>：绕水平轴 n×(0,0,1) 旋转
+     * acos(n·Z)。该旋转不引入绕世界 Z 轴的扭转，因此等价于“pitch/roll 来自
+     * 重力，yaw 固定为 0”，且天然正交、无需再正交化。
+     *
+     * @param g 设备坐标系下的加速度/重力矢量（静止时指向天空）
+     * @return 是否成功更新
+     */
+    private boolean updateRotationMatrixFromGravity(float[] g) {
+        float gx = g[0], gy = g[1], gz = g[2];
+        float len = (float) Math.sqrt(gx * gx + gy * gy + gz * gz);
+        if (len < 1.0f) {
+            // 接近自由落体，方向不可信
+            return false;
+        }
+        float nx = gx / len, ny = gy / len, nz = gz / len;
+
+        Matrix.setIdentityM(rotationMatrix, 0);
+
+        if (nz > 0.99999f) {
+            // 近似平放：单位阵
+            return true;
+        }
+        if (nz < -0.99999f) {
+            // 屏幕朝下：绕 X 轴翻转 180°，避免退化
+            rotationMatrix[5] = -1f;
+            rotationMatrix[10] = -1f;
+            return true;
+        }
+
+        // nz→-1 时分母趋零，上面已排除
+        float inv = 1f / (1f + nz);
+        rotationMatrix[0] = nz + ny * ny * inv;
+        rotationMatrix[1] = -nx * ny * inv;
+        rotationMatrix[2] = -nx;
+        rotationMatrix[4] = -nx * ny * inv;
+        rotationMatrix[5] = nz + nx * nx * inv;
+        rotationMatrix[6] = -ny;
+        rotationMatrix[8] = nx;
+        rotationMatrix[9] = ny;
+        rotationMatrix[10] = nz;
+        return true;
     }
 
     /**

@@ -126,14 +126,11 @@ public class ObjectRenderer implements GLSurfaceView.Renderer {
         float[] rotationMatrix = orientationSensor.getRotationMatrix();
 
         // 检查旋转矩阵是否有效 (初次启动可能为单位矩阵)
-        boolean isIdentity = true;
-        for (int i = 1; i < 4; i++) {
-            if (rotationMatrix[i] != 0)
-                isIdentity = false;
-        }
-
+        // 注意：不能用“是否为单位阵”来判断是否拿到数据——仅加速度计的倾斜模式下，
+        // 设备平放时矩阵本来就是单位阵，那样物体将永远不会被初始化、画面一直空白。
+        // isReady() 已经保证了数据有效，这里直接初始化。
         // 延迟初始化：当获取到有效的传感器数据后，在相机前方固定距离生成物体
-        if (!mInitialized && !isIdentity) {
+        if (!mInitialized) {
             mObjectWorldPos = calculateInsertionPoint(rotationMatrix, rotation, 2.0f);
             mInitialized = true;
             android.util.Log.d("ObjectRenderer", String.format("物体 world 坐标已初始化: [%.2f, %.2f, %.2f]",
